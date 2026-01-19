@@ -3,11 +3,12 @@ set -euo pipefail
 
 ############################################
 # handover_inventory.sh (Ubuntu 20.04)
-# - Installs required tools (apt)
-# - Collects system inventory into an OUTDIR
-# - Creates a 1-page handover summary
-# - Archives the OUTDIR as tar.gz
-# - Sends summary + archive via SMTP (SMTPS 465) using msmtp + bsd-mailx
+# - Installs required tools
+# - Collects inventory into OUTDIR
+# - Creates summary
+# - Creates full archive (optional attach)
+# - Creates light archive if full is too big
+# - Sends email via SMTP (SMTPS 465) using msmtp + bsd-mailx
 #
 # Run:
 #   sudo ./handover_inventory.sh
@@ -20,6 +21,9 @@ SEND_TO="uebergabe@smarte-ki.de"
 SMTP_USER="uebergabe@smarte-ki.de"
 SMTP_SERVER="smarte-ki.de"
 SMTP_PORT="465"
+
+# Attachment limit (10 MiB)
+MAX_ATTACH_BYTES=$((10 * 1024 * 1024))
 
 APT_PACKAGES=(
   pciutils
@@ -78,6 +82,16 @@ run() {
   } > "$OUTDIR/$file" 2> "$OUTDIR/${file}.err" || true
 }
 
+file_size() {
+  # bytes
+  local f="$1"
+  if [[ -f "$f" ]]; then
+    stat -c%s "$f" 2>/dev/null || echo 0
+  else
+    echo 0
+  fi
+}
+
 ############################################
 # DATA COLLECTION
 ############################################
@@ -129,7 +143,6 @@ CPU_MODEL="$(lscpu | awk -F: '/Model name/ {print $2}' | xargs || true)"
 CPU_SOCKETS="$(lscpu | awk -F: '/Socket\(s\)/ {print $2}' | xargs || true)"
 CPU_CORES="$(lscpu | awk -F: '/Core\(s\) per socket/ {print $2}' | xargs || true)"
 CPU_THREADS="$(lscpu | awk -F: '/Thread\(s\) per core/ {print $2}' | xargs || true)"
-
 RAM_TOTAL="$(free -h | awk '/Mem:/ {print $2}' || true)"
 
 if command -v nvidia-smi >/dev/null 2>&1; then
@@ -140,11 +153,10 @@ else
   GPU_MODEL="nvidia-smi nicht verfügbar"
 fi
 
-# Total raw disk capacity (all disks). If you want only NVMe, filter TRAN=="nvme".
 DISK_TOTAL_TB="$(lsblk -d -b -o SIZE,TYPE 2>/dev/null | awk '$2=="disk"{s+=$1} END {if (s>0) printf "%.2f TB", s/1024/1024/1024/1024; else print "n/a"}')"
-
 OS_PRETTY="$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"' || true)"
 
+SUMMARY_FILE="$OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt"
 {
   echo "=============================="
   echo "SERVER ÜBERGABE – HARDWARE"
@@ -175,21 +187,40 @@ OS_PRETTY="$(grep -E '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- 
   echo
   echo "Details siehe Einzelreports im Ordner:"
   echo "  $OUTDIR/"
-} > "$OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt"
+} > "$SUMMARY_FILE"
 
 ############################################
-# ARCHIVE
+# ARCHIVES (full + light)
 ############################################
-log "Erstelle Archiv"
-ARCHIVE="${OUTDIR}.tar.gz"
-tar -czf "$ARCHIVE" "$OUTDIR"
+log "Erstelle Archiv(e)"
+FULL_ARCHIVE="${OUTDIR}.tar.gz"
+tar -czf "$FULL_ARCHIVE" "$OUTDIR"
+
+# Light archive (only the most useful small files)
+LIGHT_ARCHIVE="${OUTDIR}_light.tar.gz"
+tar -czf "$LIGHT_ARCHIVE" \
+  -C "$OUTDIR" \
+  "ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt" \
+  "10_cpu.txt" \
+  "20_ram.txt" \
+  "30_gpu_overview.txt" \
+  "31_gpu_details.csv" \
+  "50_storage_lsblk.txt" \
+  "52_storage_df.txt" \
+  "53_nvme_list.txt" \
+  "55_smart.txt" \
+  "60_network.txt" \
+  "70_serials.txt" \
+  2>/dev/null || true
+
+FULL_SIZE="$(file_size "$FULL_ARCHIVE")"
+LIGHT_SIZE="$(file_size "$LIGHT_ARCHIVE")"
 
 ############################################
 # EMAIL SEND (SMTP 465 / SMTPS)
 ############################################
 log "E-Mail Versand vorbereiten"
 
-# Passwort sicher abfragen (nicht echoen)
 read -r -s -p "SMTP Passwort für $SMTP_USER: " SMTP_PASS
 echo
 
@@ -203,22 +234,18 @@ if ! command -v mail >/dev/null 2>&1; then
 fi
 
 FQDN="$(hostname -f 2>/dev/null || true)"
-SHORT_HOST="$HOST"
 IP_LIST="$(hostname -I 2>/dev/null | xargs || true)"
 SERIAL="$(dmidecode -s system-serial-number 2>/dev/null || true)"
 BOARD_SERIAL="$(dmidecode -s baseboard-serial-number 2>/dev/null || true)"
 
 MSMTP_CFG="$(mktemp)"
 BODY_FILE="$(mktemp)"
-
 cleanup() {
   rm -f "$MSMTP_CFG" "$BODY_FILE" 2>/dev/null || true
   unset SMTP_PASS
 }
 trap cleanup EXIT
 
-# msmtp config:
-# Port 465 = SMTPS (TLS wrapped) => tls on, tls_starttls off
 cat > "$MSMTP_CFG" <<EOF
 defaults
 auth           on
@@ -239,39 +266,74 @@ EOF
 
 export SMTP_PASS
 
-SUBJECT="[Handover] ${SHORT_HOST} | ${TS}"
+SUBJECT="[Handover] ${HOST} | ${TS}"
+
+# Decide attachments under 10 MiB
+ATTACH_MODE="summary-only"
+ATTACH_FILE=""
+
+# We ALWAYS attach summary (very small). Additionally:
+# - If full archive fits, attach it.
+# - Else if light archive fits, attach that.
+# - Else only summary.
+if [[ "$FULL_SIZE" -gt 0 && "$FULL_SIZE" -le "$MAX_ATTACH_BYTES" ]]; then
+  ATTACH_MODE="summary+full"
+  ATTACH_FILE="$FULL_ARCHIVE"
+elif [[ "$LIGHT_SIZE" -gt 0 && "$LIGHT_SIZE" -le "$MAX_ATTACH_BYTES" ]]; then
+  ATTACH_MODE="summary+light"
+  ATTACH_FILE="$LIGHT_ARCHIVE"
+else
+  ATTACH_MODE="summary-only"
+fi
 
 {
   echo "Server Handover Inventory"
   echo "========================="
   echo
   echo "Timestamp (UTC): $TS"
-  echo "Hostname:        ${SHORT_HOST:-n/a}"
+  echo "Hostname:        ${HOST:-n/a}"
   echo "FQDN:            ${FQDN:-n/a}"
   echo "IP(s):           ${IP_LIST:-n/a}"
   echo "System Serial:   ${SERIAL:-n/a}"
   echo "Board Serial:    ${BOARD_SERIAL:-n/a}"
   echo
-  echo "Attached:"
-  echo " - $OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt"
-  echo " - $ARCHIVE (vollständige Rohdaten)"
+  echo "Attachment mode: $ATTACH_MODE"
+  echo "Full archive size:  $FULL_SIZE bytes"
+  echo "Light archive size: $LIGHT_SIZE bytes"
+  echo "Limit:              $MAX_ATTACH_BYTES bytes"
   echo
   echo "Kurz-Auszug Summary:"
   echo "--------------------"
-  sed -n '1,140p' "$OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt" || true
+  sed -n '1,160p' "$SUMMARY_FILE" || true
+  echo
+  echo "Hinweis:"
+  echo "- Das vollständige Archiv wird nur angehängt, wenn es < 10 MiB ist."
+  echo "- Wenn zu groß, wird ein light-Archiv (wichtigste Files) angehängt."
+  echo "- Wenn auch das zu groß ist, geht nur die Summary raus."
 } > "$BODY_FILE"
 
 echo "📧 Sende Mail an $SEND_TO …"
-mail -S "sendmail=msmtp -C $MSMTP_CFG" \
-     -r "$SMTP_USER" \
-     -s "$SUBJECT" \
-     -a "$OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt" \
-     -a "$ARCHIVE" \
-     "$SEND_TO" < "$BODY_FILE"
+
+if [[ -n "$ATTACH_FILE" ]]; then
+  mail -S "sendmail=msmtp -C $MSMTP_CFG" \
+       -r "$SMTP_USER" \
+       -s "$SUBJECT" \
+       -a "$SUMMARY_FILE" \
+       -a "$ATTACH_FILE" \
+       "$SEND_TO" < "$BODY_FILE"
+else
+  mail -S "sendmail=msmtp -C $MSMTP_CFG" \
+       -r "$SMTP_USER" \
+       -s "$SUBJECT" \
+       -a "$SUMMARY_FILE" \
+       "$SEND_TO" < "$BODY_FILE"
+fi
 
 echo "✅ Mail versendet an: $SEND_TO"
-echo "📎 Archiv: $ARCHIVE"
 echo "🧾 msmtp log: $OUTDIR/msmtp.log"
+echo "📎 Full archive:  $FULL_ARCHIVE ($FULL_SIZE bytes)"
+echo "📎 Light archive: $LIGHT_ARCHIVE ($LIGHT_SIZE bytes)"
+echo "📎 Attach mode:   $ATTACH_MODE"
 
 ############################################
 # FINISH
@@ -279,8 +341,6 @@ echo "🧾 msmtp log: $OUTDIR/msmtp.log"
 log "Fertig ✅"
 echo
 echo "📦 Übergabeordner: $OUTDIR"
-echo "📄 Zusammenfassung: $OUTDIR/ZZ_ÜBERGABE_ZUSAMMENFASSUNG.txt"
-echo "📧 Versand: $SEND_TO"
-echo
-echo "Empfohlen:"
-echo "tar -czf ${OUTDIR}.tar.gz ${OUTDIR}"
+echo "📄 Zusammenfassung: $SUMMARY_FILE"
+echo "📦 Full archive: $FULL_ARCHIVE"
+echo "📦 Light archive: $LIGHT_ARCHIVE"
