@@ -217,19 +217,15 @@ FULL_SIZE="$(file_size "$FULL_ARCHIVE")"
 LIGHT_SIZE="$(file_size "$LIGHT_ARCHIVE")"
 
 ############################################
-# EMAIL SEND (SMTP 465 / SMTPS)
+# EMAIL SEND (SMTP 465 / SMTPS) via msmtp
 ############################################
-log "E-Mail Versand vorbereiten"
+log "E-Mail Versand vorbereiten (msmtp direkt, ohne mail -S)"
 
 read -r -s -p "SMTP Passwort für $SMTP_USER: " SMTP_PASS
 echo
 
 if ! command -v msmtp >/dev/null 2>&1; then
   echo "❌ msmtp nicht gefunden (sollte installiert sein)."
-  exit 1
-fi
-if ! command -v mail >/dev/null 2>&1; then
-  echo "❌ bsd-mailx (mail) nicht gefunden (sollte installiert sein)."
   exit 1
 fi
 
@@ -240,6 +236,7 @@ BOARD_SERIAL="$(dmidecode -s baseboard-serial-number 2>/dev/null || true)"
 
 MSMTP_CFG="$(mktemp)"
 BODY_FILE="$(mktemp)"
+
 cleanup() {
   rm -f "$MSMTP_CFG" "$BODY_FILE" 2>/dev/null || true
   unset SMTP_PASS
@@ -268,14 +265,10 @@ export SMTP_PASS
 
 SUBJECT="[Handover] ${HOST} | ${TS}"
 
-# Decide attachments under 10 MiB
+# Decide attachments under 10 MiB (uses your vars)
 ATTACH_MODE="summary-only"
 ATTACH_FILE=""
 
-# We ALWAYS attach summary (very small). Additionally:
-# - If full archive fits, attach it.
-# - Else if light archive fits, attach that.
-# - Else only summary.
 if [[ "$FULL_SIZE" -gt 0 && "$FULL_SIZE" -le "$MAX_ATTACH_BYTES" ]]; then
   ATTACH_MODE="summary+full"
   ATTACH_FILE="$FULL_ARCHIVE"
@@ -286,7 +279,20 @@ else
   ATTACH_MODE="summary-only"
 fi
 
+# Compose message in MIME (so attachments work without mailx)
+BOUNDARY="====BOUNDARY_$(date +%s%N)===="
+
 {
+  echo "From: $SMTP_USER"
+  echo "To: $SEND_TO"
+  echo "Subject: $SUBJECT"
+  echo "MIME-Version: 1.0"
+  echo "Content-Type: multipart/mixed; boundary=\"$BOUNDARY\""
+  echo
+  echo "--$BOUNDARY"
+  echo "Content-Type: text/plain; charset=\"utf-8\""
+  echo "Content-Transfer-Encoding: 8bit"
+  echo
   echo "Server Handover Inventory"
   echo "========================="
   echo
@@ -302,38 +308,41 @@ fi
   echo "Light archive size: $LIGHT_SIZE bytes"
   echo "Limit:              $MAX_ATTACH_BYTES bytes"
   echo
-  echo "Kurz-Auszug Summary:"
-  echo "--------------------"
-  sed -n '1,160p' "$SUMMARY_FILE" || true
+  echo "Summary preview:"
+  echo "----------------"
+  sed -n '1,160p' "$SUMMARY_FILE" 2>/dev/null || true
   echo
-  echo "Hinweis:"
-  echo "- Das vollständige Archiv wird nur angehängt, wenn es < 10 MiB ist."
-  echo "- Wenn zu groß, wird ein light-Archiv (wichtigste Files) angehängt."
-  echo "- Wenn auch das zu groß ist, geht nur die Summary raus."
+
+  # Attach summary file (always)
+  echo "--$BOUNDARY"
+  echo "Content-Type: text/plain; name=\"$(basename "$SUMMARY_FILE")\""
+  echo "Content-Transfer-Encoding: base64"
+  echo "Content-Disposition: attachment; filename=\"$(basename "$SUMMARY_FILE")\""
+  echo
+  base64 "$SUMMARY_FILE"
+  echo
+
+  # Attach archive if chosen
+  if [[ -n "$ATTACH_FILE" ]]; then
+    echo "--$BOUNDARY"
+    echo "Content-Type: application/gzip; name=\"$(basename "$ATTACH_FILE")\""
+    echo "Content-Transfer-Encoding: base64"
+    echo "Content-Disposition: attachment; filename=\"$(basename "$ATTACH_FILE")\""
+    echo
+    base64 "$ATTACH_FILE"
+    echo
+  fi
+
+  echo "--$BOUNDARY--"
 } > "$BODY_FILE"
 
 echo "📧 Sende Mail an $SEND_TO …"
-
-if [[ -n "$ATTACH_FILE" ]]; then
-  mail -S "sendmail=msmtp -C $MSMTP_CFG" \
-       -r "$SMTP_USER" \
-       -s "$SUBJECT" \
-       -a "$SUMMARY_FILE" \
-       -a "$ATTACH_FILE" \
-       "$SEND_TO" < "$BODY_FILE"
-else
-  mail -S "sendmail=msmtp -C $MSMTP_CFG" \
-       -r "$SMTP_USER" \
-       -s "$SUBJECT" \
-       -a "$SUMMARY_FILE" \
-       "$SEND_TO" < "$BODY_FILE"
-fi
+msmtp -C "$MSMTP_CFG" -t < "$BODY_FILE"
 
 echo "✅ Mail versendet an: $SEND_TO"
 echo "🧾 msmtp log: $OUTDIR/msmtp.log"
-echo "📎 Full archive:  $FULL_ARCHIVE ($FULL_SIZE bytes)"
-echo "📎 Light archive: $LIGHT_ARCHIVE ($LIGHT_SIZE bytes)"
 echo "📎 Attach mode:   $ATTACH_MODE"
+
 
 ############################################
 # FINISH
